@@ -129,6 +129,97 @@ __global__ void do_find_min_max_neighbored(float* d_inMin, float* d_inMax, float
 }
 
 
+__global__ void do_find_min_max_neighbored_less_divergence(float* d_inMin, float* d_inMax, float* d_outMin, float* d_outMax, unsigned int n)
+{
+	const unsigned int tid = threadIdx.x;
+	const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+	// boundary check
+	if (idx >= n) return;
+
+
+	// convert global data pointer to the local pointer of this block
+	float *inMinData = d_inMin + blockIdx.x * blockDim.x;
+	float *inMaxData = d_inMax + blockIdx.x * blockDim.x;
+
+	// in-place reduction in global memory
+	for (int stride = 1; stride < blockDim.x; stride *= 2)
+	{
+		// convert tid into local array index
+		int index = 2 * stride * tid;
+
+		if (index < blockDim.x)
+		{
+			if(inMinData[index] > inMinData[index + stride])
+			{
+				inMinData[index] = inMinData[index + stride];
+			}
+
+			if(inMaxData[index] < inMaxData[index + stride])
+			{
+				inMaxData[index] = inMaxData[index + stride];
+			}
+		}
+
+		// synchronize within threadblock
+		__syncthreads();
+	}
+
+	// write result for this block to global mem
+	if (tid == 0)
+	{
+		d_outMin[blockIdx.x] = inMinData[0];
+		d_outMax[blockIdx.x] = inMaxData[0];
+	}
+}
+
+__global__ void do_find_min_max_interleaved(float* d_inMin, float* d_inMax, float* d_outMin, float* d_outMax, unsigned int n)
+{
+	const unsigned int tid = threadIdx.x;
+	const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	int myId = threadIdx.x + blockDim.x * blockIdx.x;
+
+	// boundary check
+	if (idx >= n) return;
+
+	// convert global data pointer to the local pointer of this block
+	float *inMinData = d_inMin + blockIdx.x * blockDim.x;
+	float *inMaxData = d_inMax + blockIdx.x * blockDim.x;
+
+	// in-place reduction in global memory
+	for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+	{
+		if (tid < stride)
+		{
+			if(inMinData[tid] > inMinData[tid + stride])
+			{
+				inMinData[tid] = inMinData[tid + stride];
+			}
+
+			if(inMaxData[tid] < inMaxData[tid + stride])
+			{
+				inMaxData[tid] = inMaxData[tid + stride];
+			}
+		}
+
+		// when stride is 3, the last step (stride=1) skips 2-th element
+		if (stride == 3)
+		{
+			stride = 4;
+		}
+
+		// synchronize within threadblock
+		__syncthreads();
+	}
+
+	// write result for this block to global mem
+	if (tid == 0)
+	{
+		d_outMin[blockIdx.x] = inMinData[0];
+		d_outMax[blockIdx.x] = inMaxData[0];
+	}
+}
+
 void find_min_max(const float* d_logLuminance, size_t numPixels, float &min, float &max, find_min_max_type type)
 {
 	GpuTimer timer;
@@ -175,6 +266,15 @@ void find_min_max(const float* d_logLuminance, size_t numPixels, float &min, flo
 			do_find_min_max_neighbored<<<gridSize, blockSize>>>(d_inMin, d_inMax, d_interMin, d_interMax, numPixels);
 			do_find_min_max_neighbored<<<finalGridSize, finalBlockSize>>>(d_interMin, d_interMax, d_outMin, d_outMax, finalBlockSize.x);
 			break;
+		case neighbored_less_divergence:
+			do_find_min_max_neighbored_less_divergence<<<gridSize, blockSize>>>(d_inMin, d_inMax, d_interMin, d_interMax, numPixels);
+			do_find_min_max_neighbored_less_divergence<<<finalGridSize, finalBlockSize>>>(d_interMin, d_interMax, d_outMin, d_outMax, finalBlockSize.x);
+			break;
+		case interleaved:
+			do_find_min_max_interleaved<<<gridSize, blockSize>>>(d_inMin, d_inMax, d_interMin, d_interMax, numPixels);
+			cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+			do_find_min_max_interleaved<<<finalGridSize, finalBlockSize>>>(d_interMin, d_interMax, d_outMin, d_outMax, finalBlockSize.x);
+			break;
 	}
 	timer.Stop();
 	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
@@ -217,6 +317,10 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
        incoming d_cdf pointer which already has been allocated for you)       */
 
 	const size_t numPixels = numRows * numCols;
+
 	find_min_max(d_logLuminance, numPixels, min_logLum, max_logLum, neighbored);
+	find_min_max(d_logLuminance, numPixels, min_logLum, max_logLum, neighbored_less_divergence);
+	find_min_max(d_logLuminance, numPixels, min_logLum, max_logLum, interleaved);
+
 
 }
