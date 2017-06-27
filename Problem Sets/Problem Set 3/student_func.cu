@@ -79,7 +79,123 @@
 
 */
 
+#include <stdio.h>
 #include "utils.h"
+#include "timer.h"
+
+enum find_min_max_type {
+	neighbored, neighbored_less_divergence, interleaved
+};
+
+__global__ void do_find_min_max_neighbored(float* d_inMin, float* d_inMax, float* d_outMin, float* d_outMax, unsigned int n)
+{
+	const unsigned int tid = threadIdx.x;
+	const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+	// boundary check
+	if (idx >= n) return;
+
+
+	// convert global data pointer to the local pointer of this block
+	float *inMinData = d_inMin + blockIdx.x * blockDim.x;
+	float *inMaxData = d_inMax + blockIdx.x * blockDim.x;
+
+	// in-place reduction in global memory
+	for (int stride = 1; stride < blockDim.x; stride *= 2)
+	{
+		if ((tid % (2 * stride)) == 0)
+		{
+			if(inMinData[tid] > inMinData[tid + stride])
+			{
+				inMinData[tid] = inMinData[tid + stride];
+			}
+
+			if(inMaxData[tid] < inMaxData[tid + stride])
+			{
+				inMaxData[tid] = inMaxData[tid + stride];
+			}
+		}
+
+		// synchronize within threadblock
+		__syncthreads();
+	}
+
+	// write result for this block to global mem
+	if (tid == 0)
+	{
+		d_outMin[blockIdx.x] = inMinData[0];
+		d_outMax[blockIdx.x] = inMaxData[0];
+	}
+}
+
+
+void find_min_max(const float* d_logLuminance, size_t numPixels, float &min, float &max, find_min_max_type type)
+{
+	GpuTimer timer;
+
+	size_t ARRAY_BYTES = sizeof(float) * numPixels;
+
+	//set block/grid size
+	const dim3 blockSize(512);
+	const dim3 gridSize((numPixels + blockSize.x - 1) / blockSize.x);
+
+	const dim3 finalBlockSize(gridSize.x); // launch one thread for each block in prev step
+	const dim3 finalGridSize(1);
+
+
+	//allocate memory for min and max outputs
+	float* d_inMin = NULL;
+	float* d_inMax = NULL;
+	float* d_interMin = NULL;
+	float* d_interMax = NULL;
+
+	float* d_outMin = NULL;
+	float* d_outMax = NULL;
+
+	checkCudaErrors(cudaMalloc(&d_inMin, ARRAY_BYTES));
+	checkCudaErrors(cudaMemcpy(d_inMin, d_logLuminance, ARRAY_BYTES, cudaMemcpyDeviceToDevice));
+
+	checkCudaErrors(cudaMalloc(&d_inMax, ARRAY_BYTES));
+	checkCudaErrors(cudaMemcpy(d_inMax, d_logLuminance, ARRAY_BYTES, cudaMemcpyDeviceToDevice));
+
+	checkCudaErrors(cudaMalloc(&d_interMin, ARRAY_BYTES));
+	checkCudaErrors(cudaMalloc(&d_interMax, ARRAY_BYTES));
+
+	checkCudaErrors(cudaMalloc(&d_outMin, sizeof(float)));
+	checkCudaErrors(cudaMalloc(&d_outMax, sizeof(float)));
+
+	checkCudaErrors(cudaMemset(d_interMin, 0, ARRAY_BYTES));
+	checkCudaErrors(cudaMemset(d_interMax, 0, ARRAY_BYTES));
+
+
+	timer.Start();
+	switch(type)
+	{
+		case neighbored:
+			do_find_min_max_neighbored<<<gridSize, blockSize>>>(d_inMin, d_inMax, d_interMin, d_interMax, numPixels);
+			do_find_min_max_neighbored<<<finalGridSize, finalBlockSize>>>(d_interMin, d_interMax, d_outMin, d_outMax, finalBlockSize.x);
+			break;
+	}
+	timer.Stop();
+	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+	// copy back the min and max values from GPU
+	float h_outMin, h_outMax;
+	checkCudaErrors(cudaMemcpy(&h_outMin, d_outMin, sizeof(float), cudaMemcpyDeviceToHost));
+	checkCudaErrors(cudaMemcpy(&h_outMax, d_outMax, sizeof(float), cudaMemcpyDeviceToHost));
+
+	printf("find_min_max elapsed %f ms, min=%f, max=%f.\n", timer.Elapsed(), h_outMin, h_outMax);
+
+
+	// clean up memory
+	checkCudaErrors(cudaFree(d_inMin));
+	checkCudaErrors(cudaFree(d_inMax));
+	checkCudaErrors(cudaFree(d_interMin));
+	checkCudaErrors(cudaFree(d_interMax));
+	checkCudaErrors(cudaFree(d_outMin));
+	checkCudaErrors(cudaFree(d_outMax));
+
+}
 
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   unsigned int* const d_cdf,
@@ -100,5 +216,7 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
        the cumulative distribution of luminance values (this should go in the
        incoming d_cdf pointer which already has been allocated for you)       */
 
+	const size_t numPixels = numRows * numCols;
+	find_min_max(d_logLuminance, numPixels, min_logLum, max_logLum, neighbored);
 
 }
