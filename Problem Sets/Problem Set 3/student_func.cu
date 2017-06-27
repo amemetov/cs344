@@ -177,7 +177,6 @@ __global__ void do_find_min_max_interleaved(float* d_inMin, float* d_inMax, floa
 {
 	const unsigned int tid = threadIdx.x;
 	const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-	int myId = threadIdx.x + blockDim.x * blockIdx.x;
 
 	// boundary check
 	if (idx >= n) return;
@@ -280,11 +279,10 @@ void find_min_max(const float* d_logLuminance, size_t numPixels, float &min, flo
 	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 
 	// copy back the min and max values from GPU
-	float h_outMin, h_outMax;
-	checkCudaErrors(cudaMemcpy(&h_outMin, d_outMin, sizeof(float), cudaMemcpyDeviceToHost));
-	checkCudaErrors(cudaMemcpy(&h_outMax, d_outMax, sizeof(float), cudaMemcpyDeviceToHost));
+	checkCudaErrors(cudaMemcpy(&min, d_outMin, sizeof(float), cudaMemcpyDeviceToHost));
+	checkCudaErrors(cudaMemcpy(&max, d_outMax, sizeof(float), cudaMemcpyDeviceToHost));
 
-	printf("find_min_max elapsed %f ms, min=%f, max=%f.\n", timer.Elapsed(), h_outMin, h_outMax);
+	printf("find_min_max elapsed %f ms, min=%f, max=%f.\n", timer.Elapsed(), min, max);
 
 
 	// clean up memory
@@ -297,30 +295,70 @@ void find_min_max(const float* d_logLuminance, size_t numPixels, float &min, flo
 
 }
 
+
+__global__ void do_histogram_simple(const float *d_in, float* d_bins,
+		float logLumMin, float logLumRange,
+		const int numBins)
+{
+	const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	float item = d_in[idx];
+	unsigned int bin =  static_cast<unsigned int>((item - logLumMin) / logLumRange * numBins);
+	if(bin > numBins - 1)
+		bin = numBins - 1;
+	atomicAdd(&(d_bins[bin]), 1);
+}
+
+void histogram( const float* d_logLuminance, float** d_histogram,
+				float logLumMin, float logLumMax, float logLumRange,
+				const size_t numPixels, const size_t numBins)
+{
+	checkCudaErrors(cudaMalloc(d_histogram, sizeof(float)*numBins));
+	checkCudaErrors(cudaMemset(*d_histogram, 0, sizeof(float)*numBins));
+
+	const dim3 blockSize(32);
+	const dim3 gridSize((numPixels + blockSize.x - 1) / blockSize.x);
+
+	GpuTimer timer;
+	timer.Start();
+	do_histogram_simple<<<gridSize, blockSize>>>(d_logLuminance, *d_histogram, logLumMin, logLumRange, numBins);
+	timer.Stop();
+	printf("do_histogram_simple elapsed %f ms\n", timer.Elapsed());
+}
+
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   unsigned int* const d_cdf,
-                                  float &min_logLum,
-                                  float &max_logLum,
+                                  float &logLumMin,
+                                  float &logLumMax,
                                   const size_t numRows,
                                   const size_t numCols,
                                   const size_t numBins)
 {
   //TODO
   /*Here are the steps you need to implement
-    1) find the minimum and maximum value in the input logLuminance channel
-       store in min_logLum and max_logLum
-    2) subtract them to find the range
-    3) generate a histogram of all the values in the logLuminance channel using
-       the formula: bin = (lum[i] - lumMin) / lumRange * numBins
     4) Perform an exclusive scan (prefix sum) on the histogram to get
        the cumulative distribution of luminance values (this should go in the
        incoming d_cdf pointer which already has been allocated for you)       */
 
 	const size_t numPixels = numRows * numCols;
 
-	find_min_max(d_logLuminance, numPixels, min_logLum, max_logLum, neighbored);
-	find_min_max(d_logLuminance, numPixels, min_logLum, max_logLum, neighbored_less_divergence);
-	find_min_max(d_logLuminance, numPixels, min_logLum, max_logLum, interleaved);
+	// 1) find the minimum and maximum value in the input logLuminance channel store in min_logLum and max_logLum
+	//find_min_max(d_logLuminance, numPixels, logLumMin, logLumMax, neighbored);
+	//find_min_max(d_logLuminance, numPixels, logLumMin, logLumMax, neighbored_less_divergence);
+	find_min_max(d_logLuminance, numPixels, logLumMin, logLumMax, interleaved);
+
+	// 2) subtract them to find the range
+	float logLumRange = logLumMax - logLumMin;
+
+	// 3) generate a histogram of all the values in the logLuminance channel using the formula:
+    // bin = (lum[i] - lumMin) / lumRange * numBins
+	float* d_histogram = NULL;
+	histogram(d_logLuminance, &d_histogram, logLumMin, logLumMax, logLumRange, numPixels, numBins);
 
 
+	float* h_histogram = new float[numBins];
+	checkCudaErrors(cudaMemcpy(h_histogram, d_histogram, sizeof(float)*numBins, cudaMemcpyDeviceToHost));
+
+
+	// 5) Clean up memory
+	checkCudaErrors(cudaFree(d_histogram));
 }
